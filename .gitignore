@@ -1,9 +1,32 @@
-.README.md
+# Dependencies
+node_modules/
+.pnp
+.pnp.js
 
-.env.example
+# Next.js
+.next/
+out/
 
+# Build
+dist/
+build/
+
+# Environment files
+.env
 .env.local
+.env.development.local
+.env.test.local
+.env.production.local
 
-.claude
+# IDE / OS
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
 
-.next
+# Claude Code
+.claude/
+
+# Playwright browsers
+playwright-report/
+test-results/
