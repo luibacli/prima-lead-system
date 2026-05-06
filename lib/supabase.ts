@@ -120,6 +120,17 @@ export async function getLeadStats() {
   };
 }
 
+export async function deleteAllLeads(): Promise<number> {
+  const client = getServiceClient();
+  // Supabase requires a filter on DELETE — use neq on a constant to match all rows
+  const { error, count } = await client
+    .from("leads")
+    .delete({ count: "exact" })
+    .neq("id", "00000000-0000-0000-0000-000000000000");
+  if (error) throw error;
+  return count ?? 0;
+}
+
 export async function getAllLeadsForExport(): Promise<Lead[]> {
   const client = getServiceClient();
   const { data, error } = await client

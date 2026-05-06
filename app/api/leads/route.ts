@@ -1,7 +1,7 @@
 export const dynamic = "force-dynamic";
 
 import { NextRequest, NextResponse } from "next/server";
-import { getLeads, createLead } from "@/lib/supabase";
+import { getLeads, createLead, deleteAllLeads } from "@/lib/supabase";
 import type { LeadFilters, LeadStatus, LeadQualification } from "@/types/lead";
 
 export async function GET(req: NextRequest) {
@@ -23,6 +23,16 @@ export async function GET(req: NextRequest) {
   } catch (error) {
     console.error("[GET /api/leads]", error);
     return NextResponse.json({ error: "Failed to fetch leads" }, { status: 500 });
+  }
+}
+
+export async function DELETE() {
+  try {
+    const deleted = await deleteAllLeads();
+    return NextResponse.json({ deleted });
+  } catch (error) {
+    console.error("[DELETE /api/leads]", error);
+    return NextResponse.json({ error: "Failed to delete all leads" }, { status: 500 });
   }
 }
 
