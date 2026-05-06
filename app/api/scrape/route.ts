@@ -1,10 +1,9 @@
 export const dynamic = "force-dynamic";
+export const maxDuration = 60;
 
 import { NextRequest, NextResponse } from "next/server";
 import { scrapeBusinesses } from "@/lib/scraper";
 import { createLeads } from "@/lib/supabase";
-
-export const maxDuration = 60;
 
 export async function POST(req: NextRequest) {
   try {
@@ -15,14 +14,18 @@ export async function POST(req: NextRequest) {
       industry: string;
     };
 
-    if (!keyword || !location) {
+    if (!keyword?.trim() || !location?.trim()) {
       return NextResponse.json(
         { error: "keyword and location are required" },
         { status: 400 }
       );
     }
 
-    const { leads: scraped, errors } = await scrapeBusinesses(keyword, location, industry);
+    const { leads: scraped, errors, log } = await scrapeBusinesses(
+      keyword.trim(),
+      location.trim(),
+      (industry ?? "").trim()
+    );
 
     if (scraped.length === 0) {
       return NextResponse.json({
@@ -30,6 +33,7 @@ export async function POST(req: NextRequest) {
         count: 0,
         leads: [],
         errors: errors.length ? errors : ["No results found for your search."],
+        log,
       });
     }
 
@@ -40,12 +44,20 @@ export async function POST(req: NextRequest) {
       count: saved.length,
       leads: saved,
       errors,
+      log,
     });
   } catch (error) {
     console.error("[POST /api/scrape]", error);
     const message = error instanceof Error ? error.message : "Unknown error";
     return NextResponse.json(
-      { success: false, error: `Scraping failed: ${message}` },
+      {
+        success: false,
+        error: `Scraping failed: ${message}`,
+        count: 0,
+        leads: [],
+        errors: [`Scraping failed: ${message}`],
+        log: null,
+      },
       { status: 500 }
     );
   }

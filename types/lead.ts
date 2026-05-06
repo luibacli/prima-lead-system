@@ -41,9 +41,23 @@ export interface ScrapeRequest {
   industry: string;
 }
 
+export interface ScrapeLog {
+  generatedQuery: string;
+  detectedLocation: string;
+  totalScraped: number;
+  afterFilter: number;
+  locationBreakdown: {
+    high: number;
+    medium: number;
+    low: number;
+    discarded: number;
+  };
+}
+
 export interface ScrapeResult {
   success: boolean;
   count: number;
   leads: Lead[];
   errors: string[];
+  log: ScrapeLog;
 }
