@@ -15,6 +15,8 @@ interface RawBusiness {
   website: string | null;
   facebook: string | null;
   address: string | null;
+  rating: string | null;
+  category: string | null;
 }
 
 export interface ScrapeOutput {
@@ -24,7 +26,7 @@ export interface ScrapeOutput {
 }
 
 // ---------------------------------------------------------------------------
-// Anti-detection constants
+// Constants
 // ---------------------------------------------------------------------------
 
 const USER_AGENTS = [
@@ -34,6 +36,8 @@ const USER_AGENTS = [
   "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_4) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.5 Safari/605.1.15",
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0",
 ];
+
+const MAX_RESULTS = 15;
 
 // ---------------------------------------------------------------------------
 // Main exported function
@@ -50,25 +54,21 @@ export async function scrapeBusinesses(
 
   console.log(`[Scraper] Generated query: "${generatedQuery}"`);
   console.log(
-    `[Scraper] Location parsed → municipality="${parsedLocation.municipality}" | ` +
+    `[Scraper] Location → municipality="${parsedLocation.municipality}" | ` +
     `barangay="${parsedLocation.barangay}" | province="${parsedLocation.province}"`
   );
 
   let raw: RawBusiness[] = [];
-  let usedMock = false;
 
   try {
-    raw = await scrapeGoogle(generatedQuery, parsedLocation);
-    console.log(`[Scraper] Google raw results: ${raw.length}`);
+    raw = await scrapeMaps(generatedQuery, parsedLocation);
+    console.log(`[Scraper] Maps raw results: ${raw.length}`);
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
-    errors.push(`Scrape engine failed: ${message}. Showing generated sample data.`);
-    usedMock = true;
-    raw = getMockData(keyword, location, industry, parsedLocation);
-    console.log(`[Scraper] Fallback mock data: ${raw.length} items`);
+    errors.push(`Scrape engine failed: ${message}`);
+    console.error(`[Scraper] Fatal error: ${message}`);
   }
 
-  // Apply location relevance filter
   const { items: filtered, breakdown } = filterByLocation(raw, parsedLocation);
 
   console.log(
@@ -77,9 +77,9 @@ export async function scrapeBusinesses(
     `UNKNOWN=${breakdown.unknown} discarded=${breakdown.discarded})`
   );
 
-  if (!usedMock && breakdown.high === 0 && breakdown.medium === 0 && raw.length > 0) {
+  if (raw.length > 0 && breakdown.high === 0 && breakdown.medium === 0) {
     errors.push(
-      `No scraped results exactly matched "${parsedLocation.primaryTarget}". ` +
+      `No results exactly matched "${parsedLocation.primaryTarget}". ` +
       `Showing ${filtered.length} partial results — verify addresses manually.`
     );
   }
@@ -90,9 +90,14 @@ export async function scrapeBusinesses(
       phone: biz.phone,
       website: biz.website,
     });
+
+    const noteParts: string[] = [];
+    if (biz.rating) noteParts.push(`Rating: ${biz.rating}`);
+    if (biz.category) noteParts.push(`Category: ${biz.category}`);
+
     return {
       company_name: biz.company_name,
-      industry: industry || "General",
+      industry: industry || biz.category || "General",
       email: biz.email,
       phone: biz.phone,
       website: biz.website,
@@ -100,7 +105,7 @@ export async function scrapeBusinesses(
       address: biz.address,
       qualification,
       qualification_reason,
-      notes: null,
+      notes: noteParts.length > 0 ? noteParts.join(" | ") : null,
       status: "New",
     };
   });
@@ -122,10 +127,10 @@ export async function scrapeBusinesses(
 }
 
 // ---------------------------------------------------------------------------
-// Google Search scraping
+// Google Maps scraping orchestrator
 // ---------------------------------------------------------------------------
 
-async function scrapeGoogle(
+async function scrapeMaps(
   generatedQuery: string,
   parsedLocation: ParsedLocation
 ): Promise<RawBusiness[]> {
@@ -149,6 +154,7 @@ async function scrapeGoogle(
 
   try {
     const ua = USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)];
+
     const context = await browser.newContext({
       userAgent: ua,
       viewport: { width: 1366, height: 768 },
@@ -157,14 +163,10 @@ async function scrapeGoogle(
       extraHTTPHeaders: {
         "Accept-Language": "en-PH,en;q=0.9,fil;q=0.8",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-        "Sec-Fetch-Dest": "document",
-        "Sec-Fetch-Mode": "navigate",
-        "Sec-Fetch-Site": "none",
-        "Upgrade-Insecure-Requests": "1",
       },
     });
 
-    // Stealth: remove webdriver flag and inject realistic browser properties
+    // Stealth: remove webdriver fingerprint
     await context.addInitScript(() => {
       Object.defineProperty(navigator, "webdriver", { get: () => undefined });
       Object.defineProperty(navigator, "languages", { get: () => ["en-PH", "en", "fil"] });
@@ -176,106 +178,101 @@ async function scrapeGoogle(
         ],
       });
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      (window as any).chrome = {
-        runtime: {},
-        loadTimes: () => ({}),
-        csi: () => ({}),
-        app: {},
-      };
+      (window as any).chrome = { runtime: {}, loadTimes: () => ({}), csi: () => ({}), app: {} };
     });
 
     const page = await context.newPage();
-    page.setDefaultTimeout(20000);
+    page.setDefaultTimeout(30000);
 
-    // Append "Philippines" so Google prioritises PH-based results.
-    // gl=ph  → country filter Philippines
-    // hl=en  → English results
-    // num=20 → 20 results per page
-    const fullQuery = `${generatedQuery} Philippines`;
+    // ── Navigate directly to Maps search URL ─────────────────────────────
+    // Using the path-based search URL bypasses the search box interaction
+    // entirely and is far more reliable than fill → Enter.
+    const mapsQuery = `${generatedQuery}, Philippines`;
     const searchUrl =
-      `https://www.google.com/search` +
-      `?q=${encodeURIComponent(fullQuery)}` +
-      `&gl=ph&hl=en&num=20`;
+      `https://www.google.com/maps/search/${encodeURIComponent(mapsQuery)}?hl=en&gl=ph`;
 
-    console.log(`[Scraper] Google URL: ${searchUrl}`);
-
+    console.log(`[Scraper] Maps URL: ${searchUrl}`);
     await page.goto(searchUrl, { waitUntil: "domcontentloaded", timeout: 30000 });
+    await jitter(1500, 2500);
 
-    // Detect hard block / CAPTCHA
-    const title = await page.title();
-    if (/captcha|unusual traffic|sorry/i.test(title)) {
-      throw new Error("Google CAPTCHA or rate-limit detected");
+    await dismissConsentBanner(page);
+    await jitter(800, 1500);
+
+    // CAPTCHA guard
+    const pageTitle = await page.title();
+    if (/captcha|unusual traffic|sorry/i.test(pageTitle)) {
+      await saveDebugScreenshot(page, "captcha");
+      throw new Error("Google Maps CAPTCHA detected");
     }
 
-    // Dismiss any consent / cookie banner
-    await dismissConsentBanner(page);
+    // ── Wait for feed to be populated (not just to exist) ─────────────────
+    // The feed container appears on the Maps homepage too (empty). We must
+    // wait until at least one place link is inside it.
+    let feedHasResults = false;
+    try {
+      await page.waitForFunction(
+        () => {
+          const feed = document.querySelector('div[role="feed"]');
+          return !!feed && feed.querySelectorAll('a[href*="/maps/place/"]').length > 0;
+        },
+        { timeout: 30000 }
+      );
+      feedHasResults = true;
+    } catch {
+      // Feed may be absent — check alternate states below
+    }
 
-    // Small delay — appears more human-like
-    await jitter(800, 1800);
+    if (!feedHasResults) {
+      // Maps sometimes opens a single-place detail panel for very specific queries
+      const hasSinglePlace = (await page.$("h1")) !== null;
+      if (hasSinglePlace) {
+        console.log("[Scraper] Maps opened single-place panel — extracting directly");
+        const biz = await extractPlaceDetails(page, context, page.url());
+        return biz ? [biz] : [];
+      }
 
-    // Scroll slightly to trigger lazy-loaded results
-    await page.evaluate(() => window.scrollBy(0, 350));
-    await jitter(400, 800);
+      const bodyText = await page.evaluate(() => document.body?.innerText ?? "");
+      if (/no results|didn.t find|couldn.t find/i.test(bodyText)) {
+        console.log("[Scraper] Maps returned no results");
+        return [];
+      }
 
-    // ── 1. Extract Google Local Pack (business map cards) ─────────────────
-    const localResults = await extractLocalPack(page);
-    console.log(`[Scraper] Local pack extracted: ${localResults.length}`);
-    results.push(...localResults);
+      await saveDebugScreenshot(page, "no-feed");
+      throw new Error("Maps results feed did not load or is empty after 30 s");
+    }
 
-    // ── 2. Extract organic result URLs + titles ───────────────────────────
-    const organicEntries = await extractOrganicEntries(page);
-    console.log(`[Scraper] Organic entries: ${organicEntries.length}`);
+    await jitter(1500, 2500);
 
-    // ── 3. Visit business pages for phone / email / address / Facebook ────
-    const seen = new Set(results.map((r) => r.company_name.toLowerCase()));
-    const toVisit = organicEntries
-      .filter((e) => !shouldSkipUrl(e.url))
-      .slice(0, 6);
+    // ── Step 4: Scroll feed to collect place URLs ─────────────────────────
+    const placeUrls = await scrollFeedAndCollectUrls(page, MAX_RESULTS);
+    console.log(`[Scraper] Collected ${placeUrls.length} place URLs`);
 
-    for (const entry of toVisit) {
+    if (placeUrls.length === 0) {
+      return [];
+    }
+
+    // ── Step 5: Extract details from each place ───────────────────────────
+    const seen = new Set<string>();
+
+    for (const placeUrl of placeUrls) {
+      if (results.length >= MAX_RESULTS) break;
+
       try {
-        await jitter(1200, 2800);
-        const biz = await visitBusinessPage(context, entry.url, entry.title, parsedLocation);
-        if (biz && !seen.has(biz.company_name.toLowerCase())) {
+        await jitter(2000, 3500);
+        const biz = await extractPlaceDetails(page, context, placeUrl);
+
+        if (biz && biz.company_name && !seen.has(biz.company_name.toLowerCase())) {
           results.push(biz);
           seen.add(biz.company_name.toLowerCase());
+          console.log(
+            `[Scraper] ✓ "${biz.company_name}" | addr="${biz.address ?? "—"}" | ` +
+            `phone=${biz.phone ?? "—"} | rating=${biz.rating ?? "—"}`
+          );
         }
       } catch (err) {
-        console.log(`[Scraper] Skip ${entry.url}: ${err instanceof Error ? err.message : err}`);
-      }
-    }
-
-    // ── 4. If still nothing, broaden to municipality-only ─────────────────
-    if (results.length === 0 && parsedLocation.municipality) {
-      console.log("[Scraper] No results — retrying with municipality fallback");
-      const fallbackQuery =
-        `businesses in ${parsedLocation.municipality}` +
-        (parsedLocation.province ? `, ${parsedLocation.province}` : "") +
-        " Philippines";
-
-      await jitter(1000, 2000);
-      await page.goto(
-        `https://www.google.com/search?q=${encodeURIComponent(fallbackQuery)}&gl=ph&hl=en&num=20`,
-        { waitUntil: "domcontentloaded", timeout: 25000 }
-      );
-      await jitter(600, 1200);
-
-      const fallbackLocal = await extractLocalPack(page);
-      const fallbackOrganic = await extractOrganicEntries(page);
-
-      results.push(...fallbackLocal);
-
-      for (const entry of fallbackOrganic.filter((e) => !shouldSkipUrl(e.url)).slice(0, 3)) {
-        try {
-          await jitter(1000, 2000);
-          const biz = await visitBusinessPage(context, entry.url, entry.title, parsedLocation);
-          if (biz && !seen.has(biz.company_name.toLowerCase())) {
-            results.push(biz);
-            seen.add(biz.company_name.toLowerCase());
-          }
-        } catch {
-          // non-fatal
-        }
+        console.log(
+          `[Scraper] ✗ Skipped place: ${err instanceof Error ? err.message : String(err)}`
+        );
       }
     }
   } finally {
@@ -286,246 +283,277 @@ async function scrapeGoogle(
 }
 
 // ---------------------------------------------------------------------------
-// Local Pack extraction
+// Scroll the Maps results panel and collect all place URLs
 // ---------------------------------------------------------------------------
 
-async function extractLocalPack(page: Page): Promise<RawBusiness[]> {
-  // Google local pack entries always link to /maps/place/.
-  // We find those anchor elements and read structured text from their
-  // closest ancestor that looks like a self-contained business card.
-  return page
-    .evaluate(() => {
-      const PH_PHONE =
-        /(?:\+63|0)[\s\-.]?(?:\d{2,3}[\s\-.]?\d{3,4}[\s\-.]?\d{3,4}|\d{10})/g;
+async function scrollFeedAndCollectUrls(page: Page, maxResults: number): Promise<string[]> {
+  const collectedUrls = new Set<string>();
+  let consecutiveNoChange = 0;
+  const MAX_STALE_ROUNDS = 4;
 
-      const ADDRESS_HINTS =
-        /\b(?:st\.?|street|avenue|ave\.?|road|rd\.?|blvd|boulevard|drive|dr\.?|highway|hwy|national|barangay|brgy\.?|purok|zone|sitio|village|vill\.|subdivision|subd\.?|cebu|mandaue|lapu-lapu|davao|manila)\b/i;
+  for (let round = 0; round < 25; round++) {
+    // Harvest URLs from the current state of the feed
+    const freshUrls: string[] = await page.evaluate(() => {
+      const feed = document.querySelector('div[role="feed"]');
+      if (!feed) return [];
+      return Array.from(feed.querySelectorAll('a[href*="/maps/place/"]'))
+        .map((a) => (a as HTMLAnchorElement).href)
+        .filter((h) => h.includes("/maps/place/"));
+    });
 
-      const results: Array<{
-        company_name: string;
-        address: string | null;
-        phone: string | null;
-        website: string | null;
-        facebook: string | null;
-        email: string | null;
-      }> = [];
+    const prevSize = collectedUrls.size;
+    for (const url of freshUrls) {
+      collectedUrls.add(url);
+    }
 
-      const seen = new Set<string>();
+    console.log(
+      `[Scraper] Scroll round ${round + 1}: +${collectedUrls.size - prevSize} URLs ` +
+      `(total ${collectedUrls.size})`
+    );
 
-      // All links pointing to a Google Maps place page
-      const mapAnchors = Array.from(
-        document.querySelectorAll<HTMLAnchorElement>('a[href*="/maps/place/"]')
+    if (collectedUrls.size >= maxResults) break;
+
+    if (collectedUrls.size === prevSize) {
+      consecutiveNoChange++;
+    } else {
+      consecutiveNoChange = 0;
+    }
+    if (consecutiveNoChange >= MAX_STALE_ROUNDS) {
+      console.log("[Scraper] No new URLs after repeated scrolls — end of results");
+      break;
+    }
+
+    // Check for end-of-list text in the feed
+    const reachedEnd = await page.evaluate(() => {
+      const feed = document.querySelector('div[role="feed"]');
+      const text = (feed as HTMLElement | null)?.innerText ?? "";
+      return (
+        text.includes("You've reached the end") ||
+        text.includes("reached the end of the list") ||
+        text.includes("No more results")
       );
+    });
+    if (reachedEnd) {
+      console.log("[Scraper] Maps feed reported end of results");
+      break;
+    }
 
-      for (const anchor of mapAnchors.slice(0, 12)) {
-        // Walk up until we find a container with enough text lines
-        let container: Element | null = anchor;
-        for (let depth = 0; depth < 6; depth++) {
-          const parent: Element | null = container ? container.parentElement : null;
-          if (!parent) break;
-          const lines = (parent as HTMLElement).innerText
-            .split("\n")
-            .map((l) => l.trim())
-            .filter((l) => l.length > 0);
-          if (lines.length >= 3) { container = parent; break; }
-          container = parent;
-        }
-        if (!container) continue;
+    // Scroll the feed panel (not the window)
+    await page.evaluate(() => {
+      const feed = document.querySelector('div[role="feed"]');
+      if (feed) feed.scrollTop += 600;
+    });
 
-        const rawText = (container as HTMLElement).innerText ?? "";
-        const lines = rawText
-          .split("\n")
-          .map((l) => l.trim())
-          .filter((l) => l.length > 0);
+    await jitter(1500, 2500);
+  }
 
-        if (lines.length === 0) continue;
-
-        // First meaningful line is the business name
-        const company_name = lines[0];
-        if (
-          company_name.length < 2 ||
-          company_name.length > 120 ||
-          seen.has(company_name.toLowerCase())
-        ) continue;
-        seen.add(company_name.toLowerCase());
-
-        // Phone — first PH-format match in the card text
-        const phoneMatches = rawText.match(PH_PHONE);
-        const phone = phoneMatches ? phoneMatches[0].trim() : null;
-
-        // Address — line that looks like a street / location
-        const address =
-          lines.slice(1).find((l) => ADDRESS_HINTS.test(l) && l.length > 10) ?? null;
-
-        // Website link inside the card (non-Google, non-Maps)
-        const websiteAnchor = Array.from(container.querySelectorAll<HTMLAnchorElement>("a")).find(
-          (a) =>
-            a.href &&
-            !a.href.includes("google.com") &&
-            !a.href.includes("maps") &&
-            a.href.startsWith("http")
-        );
-        const website = websiteAnchor?.href ?? null;
-
-        // Facebook link inside the card
-        const fbAnchor = Array.from(container.querySelectorAll<HTMLAnchorElement>("a")).find(
-          (a) => a.href.includes("facebook.com") || a.href.includes("fb.com")
-        );
-        const facebook = fbAnchor?.href ?? null;
-
-        results.push({ company_name, address, phone, website, facebook, email: null });
-      }
-
-      return results;
-    })
-    .catch(() => [] as RawBusiness[]);
+  return Array.from(collectedUrls).slice(0, maxResults);
 }
 
 // ---------------------------------------------------------------------------
-// Organic results extraction
+// Navigate to a Maps place URL and extract all details
 // ---------------------------------------------------------------------------
 
-async function extractOrganicEntries(
-  page: Page
-): Promise<Array<{ title: string; url: string; snippet: string }>> {
-  return page
-    .evaluate(() => {
-      const items: Array<{ title: string; url: string; snippet: string }> = [];
-
-      // #rso is the main results container in Google Search
-      const resultDivs = Array.from(
-        document.querySelectorAll<HTMLElement>(
-          "#rso > div, #rso > div > div, div[data-sokoban-container]"
-        )
-      );
-
-      for (const div of resultDivs) {
-        const h3 = div.querySelector<HTMLElement>("h3");
-        const anchor = div.querySelector<HTMLAnchorElement>("a[href]");
-        const snippetEl = div.querySelector<HTMLElement>(
-          "[data-sncf], .VwiC3b, [class*='snippet'], [class*='lEBKkf']"
-        );
-
-        const title = h3?.innerText?.trim() ?? "";
-        const url = anchor?.href ?? "";
-        const snippet = snippetEl?.innerText?.trim() ?? "";
-
-        if (
-          title.length > 2 &&
-          url.startsWith("http") &&
-          !url.includes("google.com") &&
-          !url.includes("googleusercontent")
-        ) {
-          items.push({ title, url, snippet });
-        }
-      }
-
-      return items;
-    })
-    .catch(() => []);
-}
-
-// ---------------------------------------------------------------------------
-// Individual business page visitation
-// ---------------------------------------------------------------------------
-
-async function visitBusinessPage(
+async function extractPlaceDetails(
+  mapPage: Page,
   context: BrowserContext,
-  url: string,
-  fallbackTitle: string,
-  parsedLocation: ParsedLocation
+  placeUrl: string
 ): Promise<RawBusiness | null> {
+  await mapPage.goto(placeUrl, { waitUntil: "domcontentloaded", timeout: 20000 });
+
+  // Wait for the business name header
+  try {
+    await mapPage.waitForSelector("h1", { timeout: 12000 });
+  } catch {
+    return null;
+  }
+
+  await jitter(1000, 2000);
+
+  const data = await mapPage.evaluate(() => {
+    // ── Name ──────────────────────────────────────────────────────────────
+    const name = document.querySelector("h1")?.textContent?.trim() ?? "";
+
+    // ── Category ──────────────────────────────────────────────────────────
+    // Google Maps places the category in a button near the top of the detail panel.
+    // Class names are obfuscated but several stable patterns exist.
+    const categorySelectors = [
+      "button.DkEaL",
+      "button[jsaction*='category']",
+      "[jsan*='t_i.localPlaceDetailsTab.category']",
+      ".rogA2c .fontBodyMedium",
+    ];
+    let category: string | null = null;
+    for (const sel of categorySelectors) {
+      const el = document.querySelector(sel);
+      const text = el?.textContent?.trim();
+      if (text && text.length > 1 && text.length < 80) {
+        category = text;
+        break;
+      }
+    }
+
+    // ── Phone ──────────────────────────────────────────────────────────────
+    // data-item-id for phone is "phone:tel:+63XXXXXXXXX" — the number is in the attribute itself
+    const phoneDataEl = document.querySelector("[data-item-id^='phone:tel:']");
+    const phoneFromDataId =
+      phoneDataEl?.getAttribute("data-item-id")?.replace("phone:tel:", "").trim() ?? null;
+
+    // Fallback: tel: anchor link
+    const telAnchor = document.querySelector("a[href^='tel:']") as HTMLAnchorElement | null;
+    const phoneFromTel = telAnchor?.href?.replace("tel:", "").trim() ?? null;
+
+    // Fallback: aria-label on phone button
+    const phoneBtnLabel =
+      document
+        .querySelector("[data-item-id^='phone']")
+        ?.getAttribute("aria-label")
+        ?.replace(/^Phone:\s*/i, "")
+        .trim() ?? null;
+
+    const phone = phoneFromDataId ?? phoneFromTel ?? phoneBtnLabel ?? null;
+
+    // ── Website ────────────────────────────────────────────────────────────
+    // data-item-id="authority" is stable for the external website link
+    const websiteEl = document.querySelector("a[data-item-id='authority']") as HTMLAnchorElement | null;
+    let website = websiteEl?.href ?? null;
+
+    // Unwrap Google redirect URLs (/url?q=...)
+    if (website?.includes("google.com/url")) {
+      try {
+        const u = new URL(website);
+        const dest = u.searchParams.get("q");
+        if (dest) website = dest;
+      } catch {
+        /* keep original */
+      }
+    }
+
+    // ── Address ────────────────────────────────────────────────────────────
+    // data-item-id="address" marks the address section
+    const addrEl = document.querySelector("[data-item-id='address']");
+    let address: string | null = null;
+    if (addrEl) {
+      // Inner text of the display span/div (not icon text)
+      const addrText =
+        addrEl.querySelector(".fontBodyMedium")?.textContent?.trim() ??
+        addrEl.querySelector("span:last-child")?.textContent?.trim() ??
+        (addrEl as HTMLElement).innerText?.split("\n").find((l) => l.trim().length > 4) ??
+        null;
+
+      // aria-label is "Address: <value>"
+      const addrLabel =
+        addrEl.getAttribute("aria-label")?.replace(/^Address:\s*/i, "").trim() ?? null;
+
+      // Prefer display text over aria-label (aria-label is often truncated)
+      address = addrText && addrText.length > 4 ? addrText : addrLabel;
+    }
+
+    // Fallback: aria-label="Address: ..." on any element
+    if (!address) {
+      const fallbackAddrEl = document.querySelector("[aria-label^='Address:']");
+      if (fallbackAddrEl) {
+        address =
+          fallbackAddrEl.getAttribute("aria-label")?.replace(/^Address:\s*/i, "").trim() ?? null;
+      }
+    }
+
+    // ── Rating ─────────────────────────────────────────────────────────────
+    // aria-label is "4.1 stars " (trailing space) — match the leading number
+    const ratingEl =
+      document.querySelector("span[aria-label*='stars']") ??
+      document.querySelector("span[aria-label*='star']");
+    const ratingRaw = ratingEl?.getAttribute("aria-label") ?? "";
+    const ratingMatch = ratingRaw.match(/^([\d.]+)/);
+    const rating = ratingMatch ? ratingMatch[1] : null;
+
+    return { name, category, phone, website, address, rating };
+  });
+
+  if (!data.name) return null;
+
+  // ── Website visit for email and Facebook ──────────────────────────────
+  let email: string | null = null;
+  let facebook: string | null = null;
+
+  if (data.website) {
+    try {
+      await jitter(1200, 2200);
+      const siteData = await scrapeWebsiteForContact(context, data.website);
+      email = siteData.email;
+      facebook = siteData.facebook;
+    } catch {
+      // non-fatal — Maps data is still usable without email
+    }
+  }
+
+  return {
+    company_name: data.name,
+    phone: data.phone,
+    email,
+    website: data.website,
+    address: data.address,
+    facebook,
+    rating: data.rating,
+    category: data.category,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Visit a business website to extract email and Facebook link
+// ---------------------------------------------------------------------------
+
+async function scrapeWebsiteForContact(
+  context: BrowserContext,
+  url: string
+): Promise<{ email: string | null; facebook: string | null }> {
   const page = await context.newPage();
 
   try {
-    await page.goto(url, { waitUntil: "domcontentloaded", timeout: 15000 });
-    await jitter(400, 900);
+    await page.goto(url, { waitUntil: "domcontentloaded", timeout: 12000 });
+    await jitter(500, 1000);
 
-    const locParts = parsedLocation.parts; // passed into evaluate below
+    const result = await page.evaluate(() => {
+      // ── Email ──────────────────────────────────────────────────────────
+      const mailAnchor = document.querySelector("a[href^='mailto:']") as HTMLAnchorElement | null;
+      const emailFromLink =
+        mailAnchor?.href?.replace("mailto:", "").split("?")[0].trim() ?? null;
 
-    const data = await page.evaluate(
-      (args: { locParts: string[] }) => {
-        const PH_PHONE =
-          /(?:\+63|0)[\s\-.]?(?:\d{2,3}[\s\-.]?\d{3,4}[\s\-.]?\d{3,4}|\d{10})/;
+      const schemaEmail =
+        document.querySelector("[itemprop='email']")?.textContent?.trim() ?? null;
 
-        // ── Company name ──────────────────────────────────────────────────
-        const schemaName = document
-          .querySelector<HTMLElement>(
-            '[itemtype*="Organization"] [itemprop="name"], [itemtype*="LocalBusiness"] [itemprop="name"]'
-          )
-          ?.innerText?.trim();
+      let emailFromBody: string | null = null;
+      const bodyText = (document.body as HTMLElement)?.innerText ?? "";
+      const emailMatches = bodyText.match(
+        /[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}/g
+      );
+      if (emailMatches) {
+        emailFromBody =
+          emailMatches.find(
+            (e) =>
+              !e.endsWith("example.com") &&
+              !e.startsWith("email@") &&
+              !e.includes("youremail") &&
+              !e.includes("sample@") &&
+              !e.includes("user@") &&
+              e.length < 80
+          ) ?? null;
+      }
 
-        const h1Name = document.querySelector<HTMLElement>("h1")?.innerText?.trim();
+      const email = emailFromLink ?? schemaEmail ?? emailFromBody ?? null;
 
-        const titleName = document.title?.split(/[-|·–]/)[0]?.trim();
+      // ── Facebook ───────────────────────────────────────────────────────
+      const fbAnchor = Array.from(
+        document.querySelectorAll("a[href*='facebook.com'], a[href*='fb.com']") as NodeListOf<HTMLAnchorElement>
+      ).find((a) => !a.href.includes("/sharer") && !a.href.includes("/share?"));
+      const facebook = fbAnchor?.href ?? null;
 
-        const company_name = schemaName ?? h1Name ?? titleName ?? "";
+      return { email, facebook };
+    });
 
-        // ── Phone ─────────────────────────────────────────────────────────
-        const telAnchor = document.querySelector<HTMLAnchorElement>("a[href^='tel:']");
-        const telFromLink = telAnchor?.href?.replace("tel:", "").trim() ?? null;
-
-        const schemaTel = document
-          .querySelector<HTMLElement>("[itemprop='telephone']")
-          ?.innerText?.trim() ?? null;
-
-        const bodyPhone = (() => {
-          const bodyText = (document.body as HTMLElement).innerText ?? "";
-          const m = bodyText.match(PH_PHONE);
-          return m ? m[0].trim() : null;
-        })();
-
-        const phone = telFromLink ?? schemaTel ?? bodyPhone ?? null;
-
-        // ── Email ─────────────────────────────────────────────────────────
-        const mailAnchor = document.querySelector<HTMLAnchorElement>("a[href^='mailto:']");
-        const email =
-          mailAnchor?.href?.replace("mailto:", "").split("?")[0].trim() ??
-          document.querySelector<HTMLElement>("[itemprop='email']")?.innerText?.trim() ??
-          null;
-
-        // ── Address ───────────────────────────────────────────────────────
-        const schemaAddr =
-          document.querySelector<HTMLElement>("[itemprop='address']")?.innerText?.trim() ??
-          document.querySelector<HTMLElement>("[itemprop='streetAddress']")?.innerText?.trim() ??
-          null;
-
-        const domAddr =
-          document
-            .querySelector<HTMLElement>(".address, #address, [class*='address'], footer address")
-            ?.innerText?.trim() ?? null;
-
-        // Prefer the address that contains a known location token
-        let address = schemaAddr ?? domAddr ?? null;
-        if (address && args.locParts.length > 0) {
-          const addrLower = address.toLowerCase();
-          const hasMatch = args.locParts.some((p) => p.length >= 4 && addrLower.includes(p));
-          if (!hasMatch && domAddr) address = domAddr;
-        }
-
-        // ── Facebook ──────────────────────────────────────────────────────
-        const fbAnchor = Array.from(
-          document.querySelectorAll<HTMLAnchorElement>("a[href*='facebook.com'], a[href*='fb.com']")
-        ).find((a) => !a.href.includes("share") && !a.href.includes("sharer"));
-        const facebook = fbAnchor?.href ?? null;
-
-        return { company_name, phone, email, address, facebook };
-      },
-      { locParts }
-    );
-
-    if (!data.company_name && !fallbackTitle) return null;
-
-    return {
-      company_name: data.company_name || fallbackTitle,
-      phone: data.phone,
-      email: data.email,
-      address: data.address,
-      website: url,
-      facebook: data.facebook,
-    };
+    return result;
   } catch {
-    return null;
+    return { email: null, facebook: null };
   } finally {
     await page.close();
   }
@@ -539,102 +567,37 @@ function jitter(minMs: number, maxMs: number): Promise<void> {
   return new Promise((r) => setTimeout(r, minMs + Math.random() * (maxMs - minMs)));
 }
 
+async function saveDebugScreenshot(page: Page, label: string): Promise<void> {
+  try {
+    const path = `/tmp/maps-debug-${label}-${Date.now()}.png`;
+    await page.screenshot({ path, fullPage: false });
+    console.log(`[Scraper] Debug screenshot → ${path}`);
+  } catch {
+    // non-fatal
+  }
+}
+
 async function dismissConsentBanner(page: Page): Promise<void> {
-  // Google consent buttons (mainly for EU but can appear elsewhere)
-  const consentSelectors = [
-    'button[id*="accept"]',
-    'button[aria-label*="Accept"]',
-    'button[aria-label*="agree"]',
-    '#L2AGLb',            // "I agree" button
-    'form[action*="consent"] button',
+  const selectors = [
+    "#L2AGLb",
+    "button[aria-label*='Accept all']",
+    "button[aria-label*='Accept All']",
+    "button[aria-label*='accept all']",
+    "button[aria-label*='Agree']",
+    "button[id*='accept']",
+    "form[action*='consent'] button",
   ];
-  for (const sel of consentSelectors) {
+
+  for (const sel of selectors) {
     try {
       const btn = await page.$(sel);
       if (btn) {
         await btn.click();
-        await jitter(400, 800);
+        await jitter(600, 1200);
         return;
       }
     } catch {
-      // selector not found
+      // selector not found — try next
     }
   }
-}
-
-function shouldSkipUrl(url: string): boolean {
-  const SKIP = [
-    "google.com", "googleapis.com", "googleusercontent.com",
-    "youtube.com", "twitter.com", "x.com", "instagram.com",
-    "wikipedia.org", "wikimedia.org",
-    "facebook.com",        // FB pages require login to scrape properly
-    "linkedin.com",
-    "philstar.com", "inquirer.net", "abs-cbn.com", "sunstar.com.ph",
-    "rappler.com", "mb.com.ph", "gmanetwork.com", "manilatimes.net",
-    "pagasa.dost.gov.ph", "bsp.gov.ph",
-    "amazon.com", "shopee.ph", "lazada.com.ph",
-  ];
-  return SKIP.some((pattern) => url.includes(pattern));
-}
-
-// ---------------------------------------------------------------------------
-// Mock fallback (only used when Playwright fails entirely)
-// ---------------------------------------------------------------------------
-
-function getMockData(
-  keyword: string,
-  location: string,
-  industry: string,
-  parsed: ParsedLocation
-): RawBusiness[] {
-  void industry; // industry is baked into the location context
-
-  const prefixes = [
-    "Cebu", "Visayas", "Pacific", "Metro", "Prime", "Global", "Allied", "Summit",
-    "Horizon", "First", "Pioneer", "Excellence", "Premier", "Southern", "Island",
-    "Eastern", "Northern", "Central", "Western", "Royal",
-  ];
-  const suffixes = [
-    "Solutions", "Services", "Corporation", "Enterprises", "Group", "Holdings",
-    "Industries", "Systems", "Technologies", "Trading", "Ventures", "Builders",
-  ];
-  const domains = ["gmail.com", "yahoo.com", "outlook.com"];
-
-  const primaryLoc = parsed.municipality ?? parsed.province ?? location;
-  const province = parsed.province ?? location;
-  const brgy = parsed.barangay;
-
-  // Addresses are built from the ACTUAL input location — never hardcoded cities
-  const addresses = [
-    `${brgy ? brgy + ", " : ""}${primaryLoc}, ${province}`,
-    `National Highway, ${primaryLoc}, ${province}`,
-    `Purok 2, Barangay Center, ${primaryLoc}, ${province}`,
-    `Zone 1, ${primaryLoc}, ${province}`,
-    `Main Road, ${primaryLoc}, ${province}`,
-    `Commercial Street, ${primaryLoc}, ${province}`,
-    `Industrial Zone, ${primaryLoc}, ${province}`,
-    `Poblacion, ${primaryLoc}, ${province}`,
-    `${primaryLoc}, ${province}`,       // minimal — MEDIUM after filter
-    `${province} Province`,             // province-only — MEDIUM
-  ];
-
-  const base = `${keyword} ${location}`.toLowerCase();
-  const seed = base.split("").reduce((a, c) => a + c.charCodeAt(0), 0);
-
-  return Array.from({ length: 12 }, (_, i) => {
-    const r = (n: number) => (seed + i * 7 + n) % 10;
-    const prefix = prefixes[(seed + i * 3) % prefixes.length];
-    const suffix = suffixes[(seed + i * 5) % suffixes.length];
-    const name = `${prefix} ${suffix}`;
-    const slug = name.toLowerCase().replace(/\s+/g, "");
-
-    return {
-      company_name: name,
-      email: r(1) > 3 ? `info@${slug}.${domains[r(5) % domains.length]}` : null,
-      phone: r(2) > 2 ? `+63 32 ${200 + r(6)}${r(7)} ${1000 + seed + i}` : null,
-      website: r(3) > 4 ? `https://www.${slug}.com.ph` : null,
-      facebook: r(4) > 5 ? `https://facebook.com/${slug}` : null,
-      address: addresses[i % addresses.length],
-    };
-  });
 }
